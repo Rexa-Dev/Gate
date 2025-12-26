@@ -1,0 +1,147 @@
+package xray
+
+import (
+	"context"
+	"errors"
+	"log"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/Rexa/Gate/backend"
+	"github.com/Rexa/Gate/backend/xray/api"
+	"github.com/Rexa/Gate/common"
+	"github.com/Rexa/Gate/config"
+)
+
+type Xray struct {
+	config     *Config
+	cfg        *config.Config
+	core       *Core
+	handler    *api.XrayHandler
+	cancelFunc context.CancelFunc
+	mu         sync.RWMutex
+}
+
+func NewXray(ctx context.Context, port int, cfg *config.Config) (*Xray, error) {
+	executableAbsolutePath, err := filepath.Abs(cfg.XrayExecutablePath)
+	if err != nil {
+		return nil, err
+	}
+
+	assetsAbsolutePath, err := filepath.Abs(cfg.XrayAssetsPath)
+	if err != nil {
+		return nil, err
+	}
+
+	configAbsolutePath, err := filepath.Abs(cfg.GeneratedConfigPath)
+	if err != nil {
+		return nil, err
+	}
+
+	xCtx, xCancel := context.WithCancel(context.Background())
+
+	xray := &Xray{
+		cancelFunc: xCancel,
+		cfg:        cfg,
+	}
+
+	start := time.Now()
+
+	xrayConfig, ok := ctx.Value(backend.ConfigKey{}).(*Config)
+	if !ok {
+		return nil, errors.New("xray config has not been initialized")
+	}
+
+	if err = xrayConfig.ApplyAPI(port); err != nil {
+		return nil, err
+	}
+
+	users := ctx.Value(backend.UsersKey{}).([]*common.User)
+	xrayConfig.syncUsers(users)
+
+	xray.config = xrayConfig
+
+	log.Println("config generated in", time.Since(start).Seconds(), "second.")
+
+	core, err := NewXRayCore(executableAbsolutePath, assetsAbsolutePath, configAbsolutePath, cfg.LogBufferSize)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = core.Start(xrayConfig, cfg.Debug); err != nil {
+		return nil, err
+	}
+
+	xray.core = core
+
+	if err = xray.checkXrayStatus(); err != nil {
+		xray.Shutdown()
+		return nil, err
+	}
+
+	handler, err := api.NewXrayAPI(port)
+	if err != nil {
+		xray.Shutdown()
+		return nil, err
+	}
+	xray.handler = handler
+
+	// Wait a bit for Xray to fully initialize before starting health checks
+	// This prevents false positives during startup
+	go func() {
+		time.Sleep(time.Second * 1) // Give Xray time to fully start
+		xray.checkXrayHealth(xCtx)
+	}()
+
+	log.Println("xray started, Version:", xray.Version())
+
+	return xray, nil
+}
+
+func (x *Xray) Logs() chan string {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	return x.core.Logs()
+}
+
+func (x *Xray) Version() string {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	return x.core.Version()
+}
+
+func (x *Xray) Started() bool {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	return x.core.Started()
+}
+
+func (x *Xray) Restart() error {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if err := x.core.Restart(x.config, x.cfg.Debug); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (x *Xray) Shutdown() {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+
+	// Cancel context first to stop health checks and other goroutines
+	x.cancelFunc()
+
+	// Stop core (this now waits for process termination)
+	if x.core != nil {
+		x.core.Stop()
+	}
+
+	// Close API handler
+	if x.handler != nil {
+		x.handler.Close()
+	}
+
+	// Shutdown is now complete - all resources are cleaned up
+}
